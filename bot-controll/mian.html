@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GPS Health Check</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity=""
+    crossorigin=""
+  />
+  <style>
+    :root { --ok:#16a34a; --warn:#f59e0b; --bad:#ef4444; --muted:#64748b; }
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#0b1020;color:#e5e7eb}
+    .wrap{max-width:1000px;margin:0 auto;padding:20px}
+    h1{font-size:1.2rem;margin:0 0 12px}
+    .card{background:#11172a;border:1px solid #1f2a44;border-radius:14px;padding:16px;margin-bottom:16px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    label{font-size:.9rem;color:#cbd5e1}
+    input{width:100%;padding:10px;border-radius:10px;border:1px solid #263250;background:#0f1526;color:#e5e7eb}
+    button{padding:10px 14px;border-radius:10px;border:1px solid #263250;background:#17203a;color:#e5e7eb;cursor:pointer}
+    button:hover{filter:brightness(1.1)}
+    .status{display:flex;gap:8px;align-items:center}
+    .dot{width:10px;height:10px;border-radius:50%}
+    #map{height:420px;border-radius:14px;border:1px solid #1f2a44}
+    .kv{display:grid;grid-template-columns:170px 1fr;gap:6px;font-family:ui-monospace,Consolas,monospace}
+    .dim{color:#94a3b8}
+    .mono{font-family:ui-monospace,Consolas,monospace}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#0f172a;border:1px solid #1f2a44;font-size:.8rem}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🚗📡 GPS Health Check</h1>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Server Base URL</label>
+          <input id="serverBase" placeholder="e.g. https://bot-controll.onrender.com" />
+        </div>
+        <div>
+          <label>WebSocket Path</label>
+          <input id="wsPath" value="/ws" />
+        </div>
+      </div>
+      <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+        <button id="connectBtn">Connect</button>
+        <span class="status"><span id="wsDot" class="dot" style="background: var(--bad);"></span><span id="wsText">WS: disconnected</span></span>
+        <span class="status"><span id="gpsDot" class="dot" style="background: var(--warn);"></span><span id="gpsText">GPS: no data yet</span></span>
+        <span class="pill" id="agePill">age: —</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <div class="kv">
+            <div class="dim">Latitude</div><div id="lat" class="mono">—</div>
+            <div class="dim">Longitude</div><div id="lng" class="mono">—</div>
+            <div class="dim">Altitude (m)</div><div id="alt" class="mono">—</div>
+            <div class="dim">Timestamp</div><div id="ts" class="mono">—</div>
+            <div class="dim">Source</div><div id="src" class="mono">—</div>
+            <div class="dim">Last Message</div><div id="raw" class="mono" style="overflow:auto; white-space:nowrap;">—</div>
+          </div>
+        </div>
+        <div>
+          <div id="map"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="font-size:.9rem;">
+      <strong>Troubleshooting</strong>
+      <ul>
+        <li>WS dot stays red → check server base URL and that your backend is running and reachable.</li>
+        <li>GPS stays orange → your ESP32 may not be sending <code>{ type: "gps", lat, lng }</code> yet or it has no fix.</li>
+        <li>When opening this file locally, some browsers block fetch due to CORS/file://. If needed, serve it with a local server (e.g. VSCode Live Server or <code>npx serve</code>).</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="" crossorigin=""></script>
+  <script>
+    // ======= CONFIG =======
+    // Put your backend base here, then click Connect.
+    const DEFAULTS = {
+      SERVER_BASE: "https://bot-controll.onrender.com", // e.g. "http://192.168.1.50:4000"
+      WS_PATH: "/ws"
+    };
+
+    // ======= STATE =======
+    let ws;
+    let map, marker;
+    let lastFixTs = null;
+    let pollTimer = null;
+
+    // ======= UI HELPERS =======
+    const $ = (id) => document.getElementById(id);
+    const setDot = (el, colorVar) => el.style.background = getComputedStyle(document.documentElement).getPropertyValue(colorVar);
+    const fmt = (n, d=6) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(d) : "—";
+
+    function updateAge() {
+      const pill = $("agePill");
+      if (!lastFixTs) { pill.textContent = "age: —"; return; }
+      const secs = Math.max(0, Math.floor((Date.now() - lastFixTs)/1000));
+      pill.textContent = `age: ${secs}s`;
+      // color based on freshness
+      if (secs <= 10) pill.style.borderColor = "#1a9b58";
+      else if (secs <= 30) pill.style.borderColor = "#f59e0b";
+      else pill.style.borderColor = "#ef4444";
+    }
+    setInterval(updateAge, 1000);
+
+    // ======= MAP =======
+    function ensureMap(lat = 20.5937, lng = 78.9629, zoom = 5) { // defaults to India view
+      if (!map) {
+        map = L.map('map').setView([lat, lng], zoom);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+        marker = L.marker([lat, lng]).addTo(map);
+      } else {
+        map.setView([lat, lng], zoom);
+        marker.setLatLng([lat, lng]);
+      }
+    }
+    ensureMap();
+
+    // ======= DATA HANDLERS =======
+    function handleGPS(gps, source) {
+      if (!gps) return;
+      const { lat, lng, alt, timestamp } = gps;
+      $("lat").textContent = fmt(lat);
+      $("lng").textContent = fmt(lng);
+      $("alt").textContent = (typeof alt === "number") ? alt.toFixed(2) : "—";
+      $("ts").textContent = timestamp ? new Date(timestamp).toLocaleString() : "now";
+      $("src").textContent = source;
+      $("raw").textContent = JSON.stringify(gps);
+
+      if (typeof lat === "number" && typeof lng === "number" && !isNaN(lat) && !isNaN(lng)) {
+        ensureMap(lat, lng, 17);
+        setDot($("gpsDot"), "--ok");
+        $("gpsText").textContent = "GPS: receiving data";
+        lastFixTs = timestamp || Date.now();
+        updateAge();
+      }
+    }
+
+    // ======= WS + POLL =======
+    function connect() {
+      const base = $("serverBase").value.trim() || DEFAULTS.SERVER_BASE;
+      const path = $("wsPath").value.trim() || DEFAULTS.WS_PATH;
+
+      // Clear any previous
+      if (ws) { try { ws.close(); } catch(e){} }
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+      // Build WS URL
+      const isHttps = base.startsWith("https://");
+      const wsProto = isHttps ? "wss://" : "ws://";
+      const host = base.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+      const wsUrl = wsProto + host + path;
+
+      // Connect WS
+      ws = new WebSocket(wsUrl);
+      $("wsText").textContent = "WS: connecting…";
+      setDot($("wsDot"), "--warn");
+
+      ws.onopen = () => {
+        setDot($("wsDot"), "--ok");
+        $("wsText").textContent = "WS: connected";
+        // Register as frontend so server forwards GPS/status
+        ws.send(JSON.stringify({ type: "register", role: "frontend" }));
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.type === "gps") {
+            handleGPS({ lat: data.lat, lng: data.lng, alt: data.alt, timestamp: data.timestamp }, "websocket");
+          }
+        } catch (e) { /* ignore */ }
+      };
+
+      ws.onclose = () => {
+        setDot($("wsDot"), "--bad");
+        $("wsText").textContent = "WS: disconnected";
+      };
+
+      ws.onerror = () => {
+        setDot($("wsDot"), "--bad");
+        $("wsText").textContent = "WS: error";
+      };
+
+      // Start HTTP polling as fallback
+      const gpsUrl = base.replace(/\/+$/, "") + "/gps";
+      pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(gpsUrl, { cache: "no-store" });
+          if (!res.ok) throw new Error("No GPS yet");
+          const json = await res.json();
+          if (json && json.success !== false) {
+            handleGPS(json, "http-poll");
+          }
+        } catch (e) {
+          // no-op; keep polling
+        }
+      }, 5000);
+    }
+
+    // Prefill defaults
+    $("serverBase").value = DEFAULTS.SERVER_BASE;
+    $("wsPath").value = DEFAULTS.WS_PATH;
+    $("connectBtn").addEventListener("click", connect);
+  </script>
+</body>
+</html>
